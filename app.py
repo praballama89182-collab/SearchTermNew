@@ -493,7 +493,7 @@ with tab_compare:
             colorscale, reversescale = "Greens", False
             fmt = lambda v: f"${v:,.0f}" if pd.notna(v) else ""
 
-        text = pivot.applymap(fmt).values
+        text = pivot.map(fmt).values
         heat = go.Figure(data=go.Heatmap(
             z=pivot.values, x=pivot.columns, y=pivot.index,
             colorscale=colorscale, reversescale=reversescale,
@@ -611,7 +611,7 @@ with tab_recs:
         styled = (
             display[cols_to_show]
             .rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"})
-            .style.applymap(highlight_change, subset=["Suggested Spend Change ($)"])
+            .style.map(highlight_change, subset=["Suggested Spend Change ($)"])
             .format(precision=2)
         )
         st.dataframe(styled, use_container_width=True, height=500)

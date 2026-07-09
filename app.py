@@ -3,12 +3,15 @@ Amazon Sponsored Products — Placement Intelligence Tool (FBA-only)
 ---------------------------------------------------------------------
 Analyzes Amazon Ads placement reports (Top of Search / Rest of Search /
 Product Pages / Off Amazon) to identify the best-performing placement per
-campaign and recommend bid-adjustment actions.
+campaign and recommend quantified bid/budget reallocation.
 
 Only portfolios whose name contains "FBA" are considered by default — this
 keeps FBM, Vizari, Casafoyer, and other non-FBA portfolios from skewing the
-placement-level aggregates (their absence/presence materially shifts numbers
-like Top of Search ACOS, since that placement has fewer, more volatile rows).
+placement-level aggregates.
+
+Note: this report has no "Match Type" dimension (that's a Search Term report
+field) — its equivalent axis is Placement, so any Match-Type-style toggle
+here (pie/heatmap) is built around Placement instead.
 
 Run locally:
     pip install -r requirements.txt
@@ -27,6 +30,88 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+
+# ----------------------------------------------------------------------
+# Visual theme — Google Material palette (Looker Studio look): white
+# scorecards with colored accent bars, card-based sections, Roboto type,
+# and one consistent colorway across every chart.
+# ----------------------------------------------------------------------
+
+PALETTE = {
+    "blue": "#4285F4", "red": "#EA4335", "yellow": "#FBBC04",
+    "green": "#34A853", "purple": "#A142F4", "teal": "#24C1E0",
+}
+COLORWAY = [PALETTE["blue"], PALETTE["green"], PALETTE["red"],
+            PALETTE["yellow"], PALETTE["purple"], PALETTE["teal"]]
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@500;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Roboto', sans-serif; }
+.stApp { background-color: #F8F9FA; }
+h1, h2, h3 { font-family: 'Roboto', sans-serif; font-weight: 500; color: #202124; }
+
+.kpi-card {
+    background: #FFFFFF; border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(60,64,67,.15), 0 1px 2px rgba(60,64,67,.10);
+    border-top: 4px solid var(--accent, #4285F4);
+    height: 100%;
+}
+.kpi-label {
+    font-size: 12px; color: #5F6368; font-weight: 500;
+    text-transform: uppercase; letter-spacing: .05em;
+}
+.kpi-value {
+    font-family: 'Roboto Mono', monospace; font-size: 26px; font-weight: 700;
+    color: #202124; margin-top: 4px;
+}
+
+.section-header { display: flex; align-items: center; gap: 8px; margin: 4px 0 12px 0; }
+.section-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.section-title { font-size: 16px; font-weight: 600; color: #202124; }
+
+button[data-baseweb="tab"] { font-weight: 600; font-size: 15px; }
+[data-baseweb="tab-highlight"] { background-color: #4285F4 !important; }
+[data-testid="stMetricValue"] { font-family: 'Roboto Mono', monospace; }
+</style>
+""", unsafe_allow_html=True)
+
+
+def kpi_card(label: str, value: str, color: str) -> str:
+    return (
+        f'<div class="kpi-card" style="--accent:{color}">'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value">{value}</div></div>'
+    )
+
+
+def section_header(text: str, color: str):
+    st.markdown(
+        f'<div class="section-header"><span class="section-dot" style="background:{color}"></span>'
+        f'<span class="section-title">{text}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def style_fig(fig, height: int = 420):
+    fig.update_layout(
+        template="plotly_white",
+        font=dict(family="Roboto, sans-serif", color="#202124", size=13),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    fig.update_xaxes(showgrid=False, linecolor="#DADCE0")
+    fig.update_yaxes(showgrid=True, gridcolor="#F1F3F4", zerolinecolor="#DADCE0")
+    return fig
+
+
+def placement_color_map(df: pd.DataFrame) -> dict:
+    placements = sorted(df["Placement"].dropna().unique())
+    return {p: COLORWAY[i % len(COLORWAY)] for i, p in enumerate(placements)}
+
 
 # ----------------------------------------------------------------------
 # Data loading
@@ -96,10 +181,16 @@ def aggregate(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
     return compute_metrics(agg)
 
 
-def recommend_placements(df: pd.DataFrame, min_clicks: int, min_spend: float, rank_metric: str) -> pd.DataFrame:
+def recommend_placements(df: pd.DataFrame, min_clicks: int, min_spend: float,
+                          rank_metric: str, reallocation_pct: float) -> pd.DataFrame:
     """
-    For each campaign, ranks placements by the chosen metric among those that
-    clear the min click/spend thresholds, and flags a bid action.
+    For each campaign, ranks eligible placements by the chosen metric and
+    quantifies a reallocation: each non-best eligible placement is suggested
+    to shed `reallocation_pct` of its own spend, and the best placement is
+    suggested to absorb the sum of those shifts. This is a transparent,
+    directional heuristic — Amazon placement bidding actually works via %
+    bid modifiers, not direct dollar transfers, so treat the $ amounts as
+    guidance on direction and rough size, not a literal instruction.
     """
     camp_place = aggregate(df, ["Campaign Name", "Portfolio name", "Placement"])
     camp_totals = aggregate(df, ["Campaign Name"]).set_index("Campaign Name")
@@ -118,7 +209,7 @@ def recommend_placements(df: pd.DataFrame, min_clicks: int, min_spend: float, ra
                     "Clicks": r["Clicks"], "Orders": r["Orders"],
                     "ACOS": r["ACOS"], "ROAS": r["ROAS"], "CVR": r["CVR"], "CTR": r["CTR"],
                     "Total Campaign Spend": total_spend,
-                    "Is Best": False, "Action": "Insufficient data",
+                    "Is Best": False, "Action": "Insufficient data", "Suggested Spend Change ($)": 0.0,
                 })
             continue
 
@@ -128,17 +219,27 @@ def recommend_placements(df: pd.DataFrame, min_clicks: int, min_spend: float, ra
             eligible = eligible.sort_values("ROAS", ascending=False, na_position="last")
 
         best_placement = eligible.iloc[0]["Placement"]
+        worse_eligible = eligible.iloc[1:]
+
+        shift_out = {}
+        total_shift_in = 0.0
+        for _, r in worse_eligible.iterrows():
+            amt = r["Spend"] * reallocation_pct / 100.0
+            shift_out[r["Placement"]] = amt
+            total_shift_in += amt
 
         for _, r in g.iterrows():
-            is_best = (r["Placement"] == best_placement) and (r["Placement"] in eligible["Placement"].values)
             if r["Placement"] not in eligible["Placement"].values:
-                action = "Insufficient data"
-            elif is_best:
-                action = "Increase bid / shift budget here"
-            elif r["Clicks"] >= min_clicks and r["Sales"] == 0:
-                action = "Decrease bid — spend, no sales"
+                action, delta = "Insufficient data", 0.0
+            elif r["Placement"] == best_placement:
+                delta = total_shift_in
+                action = (f"Increase spend by ~${delta:,.0f} — shift from lower-{rank_metric.split()[0]} "
+                          f"placements in this campaign") if delta > 0 else "Increase bid / shift budget here"
             else:
-                action = "Maintain / monitor"
+                delta = -shift_out.get(r["Placement"], 0.0)
+                zero_sales_note = " (currently $0 sales)" if r["Sales"] == 0 else ""
+                action = (f"Decrease spend by ~${abs(delta):,.0f} ({reallocation_pct:.0f}% of spend) "
+                          f"— shift to {best_placement}{zero_sales_note}")
 
             rows.append({
                 "Campaign Name": camp, "Portfolio name": portfolio,
@@ -146,10 +247,13 @@ def recommend_placements(df: pd.DataFrame, min_clicks: int, min_spend: float, ra
                 "Clicks": r["Clicks"], "Orders": r["Orders"],
                 "ACOS": r["ACOS"], "ROAS": r["ROAS"], "CVR": r["CVR"], "CTR": r["CTR"],
                 "Total Campaign Spend": total_spend,
-                "Is Best": is_best, "Action": action,
+                "Is Best": r["Placement"] == best_placement, "Action": action,
+                "Suggested Spend Change ($)": round(delta, 2),
             })
 
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    out["Suggested New Spend"] = (out["Spend"] + out["Suggested Spend Change ($)"]).round(2)
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -206,6 +310,12 @@ st.sidebar.subheader("Recommendation thresholds")
 min_clicks = st.sidebar.number_input("Min clicks per placement to be eligible", min_value=0, value=10, step=5)
 min_spend = st.sidebar.number_input("Min spend ($) per placement to be eligible", min_value=0.0, value=5.0, step=1.0)
 rank_metric = st.sidebar.radio("Rank best placement by", ["ACOS (lower is better)", "ROAS (higher is better)"])
+reallocation_pct = st.sidebar.slider(
+    "Reallocation % (shift from lower-performing placements)",
+    min_value=5, max_value=50, value=20, step=5,
+    help="For each campaign, this % of each underperforming eligible placement's spend is "
+         "suggested to move toward the best-performing eligible placement."
+)
 
 # ----------------------------------------------------------------------
 # Filter
@@ -220,6 +330,8 @@ if campaign_search:
 if df.empty:
     st.warning("No rows match the current filters.")
     st.stop()
+
+PLACEMENT_COLORS = placement_color_map(df)
 
 st.title("Amazon Sponsored Products — Placement Intelligence Tool")
 scope_label = "FBA portfolios only" if fba_only else "all portfolios"
@@ -240,26 +352,47 @@ with tab_overview:
         "Orders": df["Orders"].sum(), "Units": df["Units"].sum(),
     }])).iloc[0]
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spend", f"${totals['Spend']:,.0f}")
-    c2.metric("Sales", f"${totals['Sales']:,.0f}")
-    c3.metric("ACOS", f"{totals['ACOS']*100:,.1f}%" if pd.notna(totals['ACOS']) else "—")
-    c4.metric("ROAS", f"{totals['ROAS']:.2f}" if pd.notna(totals['ROAS']) else "—")
-    c5.metric("Orders", f"{totals['Orders']:,.0f}")
+    kpis = [
+        ("Spend", f"${totals['Spend']:,.0f}", PALETTE["red"]),
+        ("Sales", f"${totals['Sales']:,.0f}", PALETTE["green"]),
+        ("ACOS", f"{totals['ACOS']*100:,.1f}%" if pd.notna(totals['ACOS']) else "—", PALETTE["yellow"]),
+        ("ROAS", f"{totals['ROAS']:.2f}" if pd.notna(totals['ROAS']) else "—", PALETTE["purple"]),
+        ("Orders", f"{totals['Orders']:,.0f}", PALETTE["blue"]),
+    ]
+    kpi_cols = st.columns(5)
+    for col, (label, value, color) in zip(kpi_cols, kpis):
+        with col:
+            st.markdown(kpi_card(label, value, color), unsafe_allow_html=True)
 
-    st.markdown("#### Spend & Sales by Placement")
-    by_place = aggregate(df, ["Placement"])
-    fig = go.Figure()
-    fig.add_bar(name="Spend", x=by_place["Placement"], y=by_place["Spend"])
-    fig.add_bar(name="Sales", x=by_place["Placement"], y=by_place["Sales"])
-    fig.update_layout(barmode="group", height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    st.markdown("#### Daily Spend Trend by Placement")
-    daily = aggregate(df, ["Date", "Placement"])
-    fig2 = px.line(daily, x="Date", y="Spend", color="Placement")
-    fig2.update_layout(height=400)
-    st.plotly_chart(fig2, use_container_width=True)
+    with st.container(border=True):
+        section_header("Spend & Sales by Placement", PALETTE["blue"])
+        by_place = aggregate(df, ["Placement"])
+        fig = go.Figure()
+        fig.add_bar(name="Spend", x=by_place["Placement"], y=by_place["Spend"],
+                    marker_color=PALETTE["red"])
+        fig.add_bar(name="Sales", x=by_place["Placement"], y=by_place["Sales"],
+                    marker_color=PALETTE["green"])
+        fig.update_layout(barmode="group")
+        style_fig(fig, height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with st.container(border=True):
+        section_header("Daily Spend Trend by Placement", PALETTE["teal"])
+        st.caption("Each placement gets its own scale (small multiples) — Off Amazon's trend "
+                   "would otherwise be flattened to a near-invisible line next to Rest of Search.")
+        daily = aggregate(df, ["Date", "Placement"]).sort_values("Date")
+        fig2 = px.line(
+            daily, x="Date", y="Spend", facet_col="Placement", facet_col_wrap=2,
+            color="Placement", color_discrete_map=PLACEMENT_COLORS, markers=True,
+        )
+        fig2.update_yaxes(matches=None, showticklabels=True)
+        fig2.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1], font=dict(size=13, color="#202124")))
+        fig2.update_traces(line=dict(width=2.5), marker=dict(size=5))
+        fig2.update_layout(showlegend=False)
+        style_fig(fig2, height=520)
+        st.plotly_chart(fig2, use_container_width=True)
 
 # ----------------------------------------------------------------------
 # Placement Comparison
@@ -270,35 +403,106 @@ with tab_compare:
                "placement — not averaged from the report's row-level ACOS/ROAS columns, which go blank "
                "on zero-sales rows and can't be validly averaged.")
 
-    st.markdown("#### Aggregated Performance by Placement (current scope)")
-    by_place = aggregate(df, ["Placement"]).sort_values("Spend", ascending=False)
-    display = by_place.copy()
-    display["CTR"] = (display["CTR"] * 100).round(2)
-    display["CVR"] = (display["CVR"] * 100).round(2)
-    display["ACOS"] = (display["ACOS"] * 100).round(1)
-    display["ROAS"] = display["ROAS"].round(2)
-    display["CPC"] = display["CPC"].round(2)
-    display["Spend"] = display["Spend"].round(2)
-    display["Sales"] = display["Sales"].round(2)
-    st.dataframe(
-        display.rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"}),
-        use_container_width=True, hide_index=True,
-    )
+    with st.container(border=True):
+        section_header("Aggregated Performance by Placement (current scope)", PALETTE["blue"])
+        by_place = aggregate(df, ["Placement"]).sort_values("Spend", ascending=False)
+        display = by_place.copy()
+        display["CTR"] = (display["CTR"] * 100).round(2)
+        display["CVR"] = (display["CVR"] * 100).round(2)
+        display["ACOS"] = (display["ACOS"] * 100).round(1)
+        display["ROAS"] = display["ROAS"].round(2)
+        display["CPC"] = display["CPC"].round(2)
+        display["Spend"] = display["Spend"].round(2)
+        display["Sales"] = display["Sales"].round(2)
+        st.dataframe(
+            display.rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"}),
+            use_container_width=True, hide_index=True,
+        )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = px.bar(by_place.sort_values("ACOS"), x="Placement", y="ACOS", title="ACOS by Placement (lower = better)")
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        fig = px.bar(by_place.sort_values("ROAS", ascending=False), x="Placement", y="ROAS", title="ROAS by Placement (higher = better)")
+    with st.container(border=True):
+        section_header("ACOS vs ROAS by Placement", PALETTE["purple"])
+        st.caption("Bars (ACOS, lower = better) and line (ROAS, higher = better) plotted together so "
+                   "you can read both signals for a placement in one glance, sorted best-to-worst by ACOS.")
+        cmp = by_place.sort_values("ACOS", na_position="last")
+        fig = go.Figure()
+        fig.add_bar(
+            name="ACOS", x=cmp["Placement"], y=cmp["ACOS"], yaxis="y",
+            marker_color=[PLACEMENT_COLORS.get(p, PALETTE["red"]) for p in cmp["Placement"]],
+            text=[f"{v*100:.1f}%" if pd.notna(v) else "—" for v in cmp["ACOS"]], textposition="outside",
+        )
+        fig.add_trace(go.Scatter(
+            name="ROAS", x=cmp["Placement"], y=cmp["ROAS"], yaxis="y2",
+            mode="lines+markers+text", line=dict(color=PALETTE["purple"], width=3),
+            marker=dict(size=11, color=PALETTE["purple"]),
+            text=[f"{v:.2f}x" if pd.notna(v) else "—" for v in cmp["ROAS"]], textposition="top center",
+        ))
+        fig.update_layout(
+            yaxis=dict(title="ACOS", tickformat=".0%"),
+            yaxis2=dict(title="ROAS", overlaying="y", side="right", showgrid=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        style_fig(fig, height=420)
         st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Placement Mix by Portfolio")
-    by_port_place = aggregate(df, ["Portfolio name", "Placement"])
-    fig3 = px.bar(by_port_place, x="Portfolio name", y="Spend", color="Placement", title="Spend Distribution")
-    fig3.update_layout(height=500, xaxis_tickangle=-45)
-    st.plotly_chart(fig3, use_container_width=True)
+    with st.container(border=True):
+        section_header("Placement Share", PALETTE["green"])
+        st.caption("This report has no Match Type dimension — its equivalent breakdown axis is "
+                   "Placement, so the toggle below is built around Placement instead.")
+        share_metric = st.selectbox("Metric", ["Ad Sales share", "Spend share", "ACOS"], key="placement_share_metric")
+        if share_metric == "ACOS":
+            fig = px.bar(
+                by_place.sort_values("ACOS", na_position="last"), x="Placement", y="ACOS",
+                color="Placement", color_discrete_map=PLACEMENT_COLORS,
+                text=by_place.sort_values("ACOS", na_position="last")["ACOS"].apply(
+                    lambda v: f"{v*100:.1f}%" if pd.notna(v) else "—"),
+            )
+            fig.update_yaxes(tickformat=".0%")
+            fig.update_traces(textposition="outside")
+            fig.update_layout(showlegend=False)
+        else:
+            value_col = "Sales" if share_metric == "Ad Sales share" else "Spend"
+            fig = px.pie(
+                by_place, names="Placement", values=value_col, hole=0.45,
+                color="Placement", color_discrete_map=PLACEMENT_COLORS,
+            )
+            fig.update_traces(textinfo="label+percent", textposition="outside")
+        style_fig(fig, height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with st.container(border=True):
+        section_header("Placement Mix by Portfolio — Top 10 by Spend", PALETTE["yellow"])
+        matrix_metric = st.selectbox("Metric", ["Spend", "Sales", "ACOS", "ROAS"], key="portfolio_matrix_metric")
+        by_port_place = aggregate(df, ["Portfolio name", "Placement"])
+        top_portfolios = (
+            aggregate(df, ["Portfolio name"]).sort_values("Spend", ascending=False).head(10)["Portfolio name"]
+        )
+        pivot_src = by_port_place[by_port_place["Portfolio name"].isin(top_portfolios)]
+        pivot = pivot_src.pivot(index="Portfolio name", columns="Placement", values=matrix_metric)
+        pivot = pivot.reindex(top_portfolios)
+
+        if matrix_metric == "ACOS":
+            colorscale, reversescale = "RdYlGn", True
+            fmt = lambda v: f"{v*100:.1f}%" if pd.notna(v) else ""
+        elif matrix_metric == "ROAS":
+            colorscale, reversescale = "RdYlGn", False
+            fmt = lambda v: f"{v:.2f}x" if pd.notna(v) else ""
+        elif matrix_metric == "Spend":
+            colorscale, reversescale = "Reds", False
+            fmt = lambda v: f"${v:,.0f}" if pd.notna(v) else ""
+        else:
+            colorscale, reversescale = "Greens", False
+            fmt = lambda v: f"${v:,.0f}" if pd.notna(v) else ""
+
+        text = pivot.applymap(fmt).values
+        heat = go.Figure(data=go.Heatmap(
+            z=pivot.values, x=pivot.columns, y=pivot.index,
+            colorscale=colorscale, reversescale=reversescale,
+            text=text, texttemplate="%{text}", textfont=dict(size=12),
+            hoverongaps=False, showscale=True,
+        ))
+        heat.update_layout(yaxis=dict(autorange="reversed"))
+        style_fig(heat, height=max(360, 42 * len(pivot)))
+        st.plotly_chart(heat, use_container_width=True)
 
 # ----------------------------------------------------------------------
 # Campaign Deep-Dive
@@ -309,47 +513,79 @@ with tab_deep_dive:
     selected_campaign = st.selectbox("Select a campaign", campaigns)
     cdf = df[df["Campaign Name"] == selected_campaign]
 
-    by_place = aggregate(cdf, ["Placement"])
-    display = by_place.copy()
-    display["ACOS"] = (display["ACOS"] * 100).round(1)
-    display["ROAS"] = display["ROAS"].round(2)
-    display["CTR"] = (display["CTR"] * 100).round(2)
-    display["CVR"] = (display["CVR"] * 100).round(2)
-    st.dataframe(
-        display.rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"}),
-        use_container_width=True, hide_index=True,
-    )
+    with st.container(border=True):
+        section_header(f"Placement Breakdown — {selected_campaign}", PALETTE["blue"])
+        by_place = aggregate(cdf, ["Placement"])
+        display = by_place.copy()
+        display["ACOS"] = (display["ACOS"] * 100).round(1)
+        display["ROAS"] = display["ROAS"].round(2)
+        display["CTR"] = (display["CTR"] * 100).round(2)
+        display["CVR"] = (display["CVR"] * 100).round(2)
+        st.dataframe(
+            display.rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"}),
+            use_container_width=True, hide_index=True,
+        )
 
     col1, col2 = st.columns(2)
     with col1:
-        fig = px.bar(by_place, x="Placement", y=["Spend", "Sales"], barmode="group",
-                     title=f"Spend vs Sales — {selected_campaign}")
-        st.plotly_chart(fig, use_container_width=True)
+        with st.container(border=True):
+            section_header("Spend vs Sales", PALETTE["green"])
+            fig = go.Figure()
+            fig.add_bar(name="Spend", x=by_place["Placement"], y=by_place["Spend"], marker_color=PALETTE["red"])
+            fig.add_bar(name="Sales", x=by_place["Placement"], y=by_place["Sales"], marker_color=PALETTE["green"])
+            fig.update_layout(barmode="group")
+            style_fig(fig, height=360)
+            st.plotly_chart(fig, use_container_width=True)
     with col2:
-        fig = px.bar(by_place, x="Placement", y="ACOS", title="ACOS by Placement")
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+        with st.container(border=True):
+            section_header("ACOS by Placement", PALETTE["yellow"])
+            fig = px.bar(
+                by_place, x="Placement", y="ACOS", color="Placement",
+                color_discrete_map=PLACEMENT_COLORS,
+                text=by_place["ACOS"].apply(lambda v: f"{v*100:.1f}%" if pd.notna(v) else "—"),
+            )
+            fig.update_yaxes(tickformat=".0%")
+            fig.update_traces(textposition="outside")
+            fig.update_layout(showlegend=False)
+            style_fig(fig, height=360)
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Daily Trend")
-    daily = aggregate(cdf, ["Date", "Placement"])
-    metric_choice = st.radio("Metric", ["Spend", "Sales", "ACOS", "ROAS", "Clicks"], horizontal=True)
-    fig = px.line(daily, x="Date", y=metric_choice, color="Placement")
-    st.plotly_chart(fig, use_container_width=True)
+    with st.container(border=True):
+        section_header("Daily Trend", PALETTE["purple"])
+        daily = aggregate(cdf, ["Date", "Placement"]).sort_values("Date")
+        metric_choice = st.radio("Metric", ["Spend", "Sales", "ACOS", "ROAS", "Clicks"], horizontal=True)
+        fig = px.line(
+            daily, x="Date", y=metric_choice, color="Placement",
+            color_discrete_map=PLACEMENT_COLORS, markers=True,
+        )
+        fig.update_traces(line=dict(width=3), marker=dict(size=7))
+        if metric_choice == "ACOS":
+            fig.update_yaxes(tickformat=".0%")
+        fig.update_layout(
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        style_fig(fig, height=420)
+        st.plotly_chart(fig, use_container_width=True)
 
 # ----------------------------------------------------------------------
 # Recommendations
 # ----------------------------------------------------------------------
 
 with tab_recs:
-    st.markdown("#### Best Placement per Campaign")
+    section_header("Best Placement per Campaign — Quantified Reallocation", PALETTE["red"])
     st.caption(
-        "A placement is 'eligible' once it clears the click/spend thresholds set in the sidebar. "
-        "Among eligible placements, the best one is ranked by the metric you chose (ACOS or ROAS)."
+        f"A placement is 'eligible' once it clears the click/spend thresholds set in the sidebar. "
+        f"Among eligible placements, the best one is ranked by {rank_metric}. Each other eligible "
+        f"placement is suggested to shift {reallocation_pct:.0f}% of its own spend toward the best one — "
+        f"a transparent, directional heuristic. Amazon placement bidding actually works through % bid "
+        f"modifiers, not direct dollar transfers, so treat these $ amounts as guidance on direction and "
+        f"rough size, not a literal instruction."
     )
 
-    recs = recommend_placements(df, min_clicks, min_spend, rank_metric)
+    recs = recommend_placements(df, min_clicks, min_spend, rank_metric, reallocation_pct)
 
-    only_best = st.checkbox("Show only the recommended (best) row per campaign", value=True)
+    only_best = st.checkbox("Show only the recommended (best) row per campaign", value=False)
     show = recs[recs["Is Best"]] if only_best else recs
 
     display = show.copy()
@@ -359,27 +595,48 @@ with tab_recs:
     display["CTR"] = (display["CTR"] * 100).round(2)
     display = display.sort_values("Total Campaign Spend", ascending=False)
 
-    st.dataframe(
-        display[[
+    def highlight_change(val):
+        if val > 0:
+            return "background-color:#e6f4ea; color:#137333; font-weight:600;"
+        elif val < 0:
+            return "background-color:#fce8e6; color:#c5221f; font-weight:600;"
+        return ""
+
+    with st.container(border=True):
+        cols_to_show = [
             "Campaign Name", "Portfolio name", "Placement", "Spend", "Sales",
-            "Clicks", "Orders", "ACOS", "ROAS", "CVR", "CTR", "Action",
-        ]].rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"}),
-        use_container_width=True, hide_index=True, height=500,
-    )
+            "Clicks", "Orders", "ACOS", "ROAS", "CVR", "CTR",
+            "Suggested Spend Change ($)", "Suggested New Spend", "Action",
+        ]
+        styled = (
+            display[cols_to_show]
+            .rename(columns={"CTR": "CTR %", "CVR": "CVR %", "ACOS": "ACOS %"})
+            .style.applymap(highlight_change, subset=["Suggested Spend Change ($)"])
+            .format(precision=2)
+        )
+        st.dataframe(styled, use_container_width=True, height=500)
 
-    action_counts = recs[recs["Action"] != "Insufficient data"]["Action"].value_counts()
+    action_counts = recs[recs["Action"] != "Insufficient data"]["Action"].apply(
+        lambda a: "Increase spend" if a.startswith("Increase") else
+                  ("Decrease spend" if a.startswith("Decrease") else a)
+    ).value_counts()
     if not action_counts.empty:
-        fig = px.pie(names=action_counts.index, values=action_counts.values, title="Action Breakdown")
-        st.plotly_chart(fig, use_container_width=True)
+        with st.container(border=True):
+            section_header("Action Breakdown", PALETTE["teal"])
+            fig = px.pie(names=action_counts.index, values=action_counts.values,
+                        color_discrete_sequence=COLORWAY, hole=0.45)
+            style_fig(fig, height=360)
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Export")
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        recs.to_excel(writer, sheet_name="All Campaigns x Placements", index=False)
-        recs[recs["Is Best"]].to_excel(writer, sheet_name="Recommended Placement", index=False)
-    st.download_button(
-        "Download recommendations (.xlsx)",
-        data=buf.getvalue(),
-        file_name="placement_recommendations.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    with st.container(border=True):
+        section_header("Export", PALETTE["blue"])
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            recs.to_excel(writer, sheet_name="All Campaigns x Placements", index=False)
+            recs[recs["Is Best"]].to_excel(writer, sheet_name="Recommended Placement", index=False)
+        st.download_button(
+            "Download recommendations (.xlsx)",
+            data=buf.getvalue(),
+            file_name="placement_recommendations.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
